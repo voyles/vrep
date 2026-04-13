@@ -1,6 +1,6 @@
-# vrep-core Linux Notes
+# vrep-core (Vector Grep) v1.0.0
 
-This project is now prepared for Linux-first usage as a normal system command.
+A high-performance semantic log scanner that bypasses the "Neural Wall" using a two-pass architecture and sidecar indexing.
 
 ## Install as a command
 
