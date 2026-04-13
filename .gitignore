@@ -1,0 +1,17 @@
+# Create the ignore file
+cat <<EOF > .gitignore
+# Build artifacts
+target/
+**/*.rs.bk
+
+# VREP Indexes (Neural Cache)
+*.vrepidx
+
+# Environment & Logs
+.env
+*.log
+EOF
+
+# Commit the safeguard
+git add .gitignore
+git commit -m "chore: add .gitignore to protect repo from build/index artifacts"
