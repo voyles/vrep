@@ -810,7 +810,7 @@ pub fn scan_file_with_onnx_batches(
 
     if let Ok(mut index) = build_vector_index_from_bytes(&mmap, encoder, batch_size) {
         index.file_size = mmap.len() as u64;
-        index.modified_nanos = path_modified_nanos(path)?;
+        index.last_modified = path_modified_nanos(path)?;
         let _ = save_vector_index(path, &index);
         return Ok(scan_cached_vectors_from(
             &mmap,
@@ -1275,7 +1275,7 @@ pub fn write_benchmark<W: Write>(writer: &mut W, stats: &ScanStats) -> io::Resul
 
 struct VectorIndex {
     file_size: u64,
-    modified_nanos: u128,
+    last_modified: u128,
     vectors: Vec<[u64; VECTOR_WORDS]>,
     sources: Vec<SourceRef>,
 }
@@ -1328,7 +1328,7 @@ fn build_vector_index_from_bytes(
 
     Ok(VectorIndex {
         file_size: bytes.len() as u64,
-        modified_nanos: 0,
+        last_modified: 0,
         vectors,
         sources,
     })
@@ -1340,7 +1340,7 @@ fn save_vector_index(path: &Path, index: &VectorIndex) -> io::Result<()> {
 
     writer.write_all(INDEX_MAGIC)?;
     writer.write_all(&index.file_size.to_le_bytes())?;
-    writer.write_all(&index.modified_nanos.to_le_bytes())?;
+    writer.write_all(&index.last_modified.to_le_bytes())?;
     writer.write_all(&(index.sources.len() as u64).to_le_bytes())?;
 
     for (source, bits) in index.sources.iter().zip(index.vectors.iter()) {
@@ -1363,8 +1363,8 @@ fn load_vector_index(path: &Path) -> io::Result<Option<VectorIndex>> {
     }
 
     let file_size = std::fs::metadata(path)?.len();
-    let modified_nanos = path_modified_nanos(path)?;
-    let mut reader = BufReader::new(File::open(index_path)?);
+    let last_modified = path_modified_nanos(path)?;
+    let mut reader = BufReader::new(File::open(&index_path)?);
 
     let mut magic = [0_u8; 8];
     if reader.read_exact(&mut magic).is_err() || &magic != INDEX_MAGIC {
@@ -1372,8 +1372,9 @@ fn load_vector_index(path: &Path) -> io::Result<Option<VectorIndex>> {
     }
 
     let indexed_size = read_u64(&mut reader)?;
-    let indexed_modified = read_u128(&mut reader)?;
-    if indexed_size != file_size || indexed_modified != modified_nanos {
+    let indexed_last_modified = read_u128(&mut reader)?;
+    if indexed_size != file_size || indexed_last_modified != last_modified {
+        let _ = std::fs::remove_file(&index_path);
         return Ok(None);
     }
 
@@ -1400,7 +1401,7 @@ fn load_vector_index(path: &Path) -> io::Result<Option<VectorIndex>> {
 
     Ok(Some(VectorIndex {
         file_size,
-        modified_nanos,
+        last_modified,
         vectors,
         sources,
     }))
