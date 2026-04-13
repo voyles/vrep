@@ -1,0 +1,3 @@
+The network connection is failing.
+I am eating a green apple.
+The server is unreachable.
