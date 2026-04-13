@@ -36,6 +36,7 @@ use vrep_core::{
 use tokenizers::Tokenizer;
 
 const DEFAULT_TOP_K: usize = 5;
+const DEFAULT_MAX_DISTANCE: u32 = 512;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,10 +68,12 @@ struct Args {
     #[arg(
         short = 'd',
         long,
-        value_name = "SIMILARITY",
-        help = "Minimum cosine similarity threshold (0.0 to 1.0); higher is a tighter match"
+        value_name = "DISTANCE",
+        default_value_t = DEFAULT_MAX_DISTANCE,
+        value_parser = clap::value_parser!(u32).range(0..=512),
+        help = "Maximum Hamming distance threshold (0 to 512); lower is a tighter match."
     )]
-    max_distance: Option<u32>,
+    max_distance: u32,
     #[arg(
         long,
         help = "Validate ONNX model assets in ./model and exit without scanning"
@@ -139,7 +142,7 @@ fn run(args: Args) -> io::Result<i32> {
                         input_path,
                         query,
                         args.top_k,
-                        args.max_distance,
+                        Some(args.max_distance),
                         onnx,
                         ONNX_BATCH_SIZE,
                             args.filter.as_deref(),
@@ -148,7 +151,7 @@ fn run(args: Args) -> io::Result<i32> {
                         &bytes,
                         query,
                         args.top_k,
-                        args.max_distance,
+                        Some(args.max_distance),
                         mock,
                     ),
                 };
@@ -164,7 +167,7 @@ fn run(args: Args) -> io::Result<i32> {
                         &bytes,
                         query,
                         args.top_k,
-                        args.max_distance,
+                        Some(args.max_distance),
                         onnx,
                         ONNX_BATCH_SIZE,
                         args.filter.as_deref(),
@@ -173,7 +176,7 @@ fn run(args: Args) -> io::Result<i32> {
                         &bytes,
                         query,
                         args.top_k,
-                        args.max_distance,
+                        Some(args.max_distance),
                         mock,
                     ),
                 };
