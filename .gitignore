@@ -7,17 +7,16 @@ target/
 # VREP Indexes (Neural Cache)
 *.vrepidx
 
+# Large Data & Testing Files
+*.txt
+*.csv
+# Or list them explicitly:
+stress.txt
+heavy.txt
+large.txt
+rockyou_clean.txt
+
 # Environment & Logs
 .env
 *.log
 EOF
-
-# Commit the safeguard
-git add .gitignore
-git commit -m "chore: add .gitignore to protect repo from build/index artifacts"stress.txt
-heavy.txt
-large.txt
-stress.txt
-stress.txt
-heavy.txt
-large.txt

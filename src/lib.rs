@@ -14,8 +14,10 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,7 @@ use memchr::memchr_iter;
 use memmap2::{Mmap, MmapOptions};
 use ort::{inputs, session::Session, value::TensorRef};
 use rayon::prelude::*;
+use regex::Regex;
 use tokenizers::{Encoding, Tokenizer};
 
 /// Number of `u64` lanes in a binary embedding.
@@ -34,11 +37,14 @@ use tokenizers::{Encoding, Tokenizer};
 /// semantic fingerprint while still fitting naturally into a tight XOR plus POPCNT loop.
 pub const VECTOR_WORDS: usize = 8;
 pub const ONNX_BATCH_SIZE: usize = 32;
+const SEARCH_CHUNK_SIZE: usize = 5000;
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 const DUMMY_LINE: &[u8] = b"vector-placeholder payload for binary scan benchmark\n";
 const EMBEDDING_DIMS: usize = 384;
 const INDEX_MAGIC: &[u8; 8] = b"VRPXIDX1";
+const INDEX_HEADER_BYTES: usize = 8 + 8 + 16 + 8;
+const CHEAP_BYPASS_MIN_LEN: usize = 12;
 
 /// Generates a packed 512-bit embedding for a line of text.
 ///
@@ -244,6 +250,11 @@ impl OnnxEncoder {
 
         if let Ok(cache) = self.cache.lock() {
             for (index, &text) in texts.iter().enumerate() {
+                if let Some(bits) = cheap_bypass_bits(text) {
+                    results[index] = bits;
+                    continue;
+                }
+
                 let cache_key = simple_hash(text);
                 if let Some(bits) = cache.get(&cache_key) {
                     results[index] = *bits;
@@ -254,6 +265,11 @@ impl OnnxEncoder {
             }
         } else {
             for (index, &text) in texts.iter().enumerate() {
+                if let Some(bits) = cheap_bypass_bits(text) {
+                    results[index] = bits;
+                    continue;
+                }
+
                 missing_meta.push((index, simple_hash(text)));
                 missing_texts.push(text);
             }
@@ -291,6 +307,117 @@ impl OnnxEncoder {
         }
 
         results
+    }
+
+    pub fn batch_encode_owned(&self, texts: Vec<String>) -> Vec<Option<[u64; VECTOR_WORDS]>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = vec![None; texts.len()];
+        let mut missing_meta = Vec::with_capacity(texts.len());
+        let mut missing_indices = Vec::with_capacity(texts.len());
+        let mut missing_refs = Vec::with_capacity(texts.len());
+
+        if let Ok(cache) = self.cache.lock() {
+            for (index, text) in texts.iter().enumerate() {
+                if let Some(bits) = cheap_bypass_bits(text) {
+                    results[index] = Some(bits);
+                    continue;
+                }
+
+                let cache_key = simple_hash(text);
+                if let Some(bits) = cache.get(&cache_key) {
+                    results[index] = Some(*bits);
+                } else {
+                    missing_meta.push((index, cache_key));
+                    missing_indices.push(index);
+                    missing_refs.push(text.as_str());
+                }
+            }
+        } else {
+            for (index, text) in texts.iter().enumerate() {
+                if let Some(bits) = cheap_bypass_bits(text) {
+                    results[index] = Some(bits);
+                    continue;
+                }
+
+                missing_meta.push((index, simple_hash(text)));
+                missing_indices.push(index);
+                missing_refs.push(text.as_str());
+            }
+        }
+
+        if missing_meta.is_empty() {
+            return results;
+        }
+
+        match self.infer_embeddings_batch(&missing_refs) {
+            Ok(encoded) => {
+                if let Ok(mut cache) = self.cache.lock() {
+                    for ((index, cache_key), bits) in missing_meta.into_iter().zip(encoded.into_iter()) {
+                        if cache.len() >= self.cache_capacity {
+                            cache.clear();
+                        }
+                        cache.insert(cache_key, bits);
+                        results[index] = Some(bits);
+                    }
+                } else {
+                    for ((index, _), bits) in missing_meta.into_iter().zip(encoded.into_iter()) {
+                        results[index] = Some(bits);
+                    }
+                }
+            }
+            Err(error) => {
+                if !self.warned_once.swap(true, Ordering::Relaxed) {
+                    eprintln!("warning: ONNX batch inference unavailable, retrying per record: {error}");
+                }
+                for index in missing_indices {
+                    let text = &texts[index];
+                    let bits = match catch_unwind(AssertUnwindSafe(|| self.try_generate_strict(text))) {
+                        Ok(Ok(bits)) => Some(bits),
+                        _ => None,
+                    };
+                    results[index] = bits;
+                }
+            }
+        }
+
+        results
+    }
+
+    fn try_generate_strict(&self, text: &str) -> io::Result<[u64; VECTOR_WORDS]> {
+        if let Some(bits) = cheap_bypass_bits(text) {
+            return Ok(bits);
+        }
+
+        let cache_key = simple_hash(text);
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(bits) = cache.get(&cache_key) {
+                return Ok(*bits);
+            }
+        }
+
+        let encoding = self.tokenizer.encode(text, true).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tokenization failed for record: {error}"),
+            )
+        })?;
+
+        let embedding = self.with_thread_session(|session| {
+            Self::run_inference(session, &self.input_bindings, &encoding)
+        })?;
+        let bits = quantize_sign_bits(&embedding);
+
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= self.cache_capacity {
+                cache.clear();
+            }
+            cache.insert(cache_key, bits);
+        }
+
+        Ok(bits)
     }
 
     fn infer_embeddings_batch<'a>(&self, texts: &[&'a str]) -> io::Result<Vec<[u64; VECTOR_WORDS]>> {
@@ -782,19 +909,6 @@ pub fn scan_file_with_onnx_batches(
     let total_start = Instant::now();
     let mmap = map_file_read_only(path)?;
 
-    if max_distance == Some(0) {
-        return Ok(scan_bytes_with_onnx_batches_from(
-            &mmap,
-            query,
-            top_k,
-            max_distance,
-            encoder,
-            batch_size,
-            filter,
-            total_start,
-        ));
-    }
-
     if let Some(index) = load_vector_index(path)? {
         return Ok(scan_cached_vectors_from(
             &mmap,
@@ -891,39 +1005,32 @@ fn scan_bytes_with_encoder_from<E: EmbeddingGenerator>(
     }
 
     let query_bits = encoder.generate(query);
-    let base_addr = bytes.as_ptr() as usize;
+    let line_sources = collect_line_sources(bytes);
     let search_start = Instant::now();
-    let (mut hits, vector_count) = bytes
-        .par_split(|byte| *byte == b'\n')
+    let vector_count = line_sources.len();
+    let (hits, candidate_count) = line_sources
+        .par_chunks(SEARCH_CHUNK_SIZE)
         .fold(
             || (Vec::with_capacity(top_k), 0usize),
-            |(mut local_hits, mut local_count), raw_line| {
-                let byte_offset = (raw_line.as_ptr() as usize).saturating_sub(base_addr);
+            |(mut local_hits, mut local_candidates), chunk| {
+                // Precompute candidate embeddings in a separate pass so the hottest
+                // comparison loop only executes Hamming distance plus thresholding.
+                let texts: Vec<String> = chunk
+                    .iter()
+                    .map(|source| line_as_str_lossy(line_bytes(bytes, *source)))
+                    .collect();
+                let candidate_bits: Vec<[u64; VECTOR_WORDS]> =
+                    texts.iter().map(|text| encoder.generate(text)).collect();
 
-                if raw_line.is_empty() && byte_offset == bytes.len() {
-                    return (local_hits, local_count);
+                local_candidates += chunk.len();
+                for (source, bits) in chunk.iter().copied().zip(candidate_bits.into_iter()) {
+                    let distance = hamming_distance(&bits, &query_bits);
+                    if max_distance.is_none_or(|limit| distance <= limit) {
+                        insert_top_hit(&mut local_hits, SearchHit { distance, source }, top_k);
+                    }
                 }
 
-                local_count += 1;
-                let line = trim_carriage_return(raw_line);
-                let bits = encoder.generate(line_as_str(line));
-
-                // Map stage: compute distance immediately after encoding, then filter
-                // before any cross-thread merge to keep per-worker state compact.
-                let distance = hamming_distance(&bits, &query_bits);
-                if max_distance.is_none_or(|limit| distance <= limit) {
-                    let hit = SearchHit {
-                        distance,
-                        source: SourceRef {
-                            line_number: 0,
-                            byte_offset,
-                            byte_len: line.len(),
-                        },
-                    };
-                    insert_top_hit(&mut local_hits, hit, top_k);
-                }
-
-                (local_hits, local_count)
+                (local_hits, local_candidates)
             },
         )
         .reduce(
@@ -936,10 +1043,6 @@ fn scan_bytes_with_encoder_from<E: EmbeddingGenerator>(
             },
         );
 
-    for hit in &mut hits {
-        hit.source.line_number = line_number_at_offset(bytes, hit.source.byte_offset);
-    }
-
     let search_latency = search_start.elapsed();
     let total_latency = total_start.elapsed();
 
@@ -948,7 +1051,7 @@ fn scan_bytes_with_encoder_from<E: EmbeddingGenerator>(
         stats: ScanStats {
             bytes_scanned: bytes.len(),
             vector_count,
-            candidate_count: vector_count,
+            candidate_count,
             total_latency,
             chunk_latency: Duration::ZERO,
             search_latency,
@@ -980,6 +1083,19 @@ fn scan_bytes_with_onnx_batches_from(
         };
     }
 
+    if let Ok(index) = build_vector_index_from_bytes(bytes, encoder, batch_size) {
+        return scan_cached_vectors_from(
+            bytes,
+            query,
+            top_k,
+            max_distance,
+            encoder,
+            filter,
+            &index,
+            total_start,
+        );
+    }
+
     let query_bits = encoder.generate(query);
     let batch_size = batch_size.max(1);
     let line_sources = collect_line_sources(bytes);
@@ -994,9 +1110,9 @@ fn scan_bytes_with_onnx_batches_from(
     let vector_count = line_sources.len();
 
     let (hits, candidate_count) = line_sources
-        .par_chunks(batch_size)
+        .chunks(batch_size)
         .fold(
-            || (Vec::with_capacity(top_k), 0usize),
+            (Vec::with_capacity(top_k), 0usize),
             |(mut local_hits, mut local_candidates), batch| {
                 // Pass 1: filter on bytes to avoid UTF-8 conversion for skipped lines.
                 let mut candidates: Vec<SourceRef> = Vec::with_capacity(batch.len());
@@ -1017,11 +1133,12 @@ fn scan_bytes_with_onnx_batches_from(
 
                 // Pass 2: encode only filtered candidates.
                 local_candidates += candidates.len();
-                let texts: Vec<&str> = candidates
+                let texts: Vec<String> = candidates
                     .iter()
-                    .map(|source| line_as_str(line_bytes(bytes, *source)))
+                    .map(|source| line_as_str_lossy(line_bytes(bytes, *source)))
                     .collect();
-                let bits_batch = encoder.batch_encode(&texts);
+                let text_refs: Vec<&str> = texts.iter().map(|text| text.as_str()).collect();
+                let bits_batch = encoder.batch_encode(&text_refs);
 
                 for (source, bits) in candidates.into_iter().zip(bits_batch.into_iter()) {
                     let distance = hamming_distance(&bits, &query_bits);
@@ -1034,15 +1151,6 @@ fn scan_bytes_with_onnx_batches_from(
                     }
                 }
                 (local_hits, local_candidates)
-            },
-        )
-        .reduce(
-            || (Vec::with_capacity(top_k), 0usize),
-            |(mut left_hits, left_candidates), (right_hits, right_candidates)| {
-                for hit in right_hits {
-                    insert_top_hit(&mut left_hits, hit, top_k);
-                }
-                (left_hits, left_candidates + right_candidates)
             },
         );
 
@@ -1077,8 +1185,12 @@ pub fn chunk_vectors_with_encoder<E: EmbeddingGenerator>(
     for line_end in memchr_iter(b'\n', bytes) {
         line_number += 1;
         let line = trim_carriage_return(&bytes[line_start..line_end]);
+        if is_corrupted_line(line) {
+            line_start = line_end + 1;
+            continue;
+        }
         chunks.push(VectorChunk {
-            bits: encoder.generate(line_as_str(line)),
+            bits: encoder.generate(&line_as_str_lossy(line)),
             source: SourceRef {
                 line_number,
                 byte_offset: line_start,
@@ -1091,14 +1203,16 @@ pub fn chunk_vectors_with_encoder<E: EmbeddingGenerator>(
     if line_start < bytes.len() {
         line_number += 1;
         let line = trim_carriage_return(&bytes[line_start..]);
-        chunks.push(VectorChunk {
-            bits: encoder.generate(line_as_str(line)),
-            source: SourceRef {
-                line_number,
-                byte_offset: line_start,
-                byte_len: line.len(),
-            },
-        });
+        if !is_corrupted_line(line) {
+            chunks.push(VectorChunk {
+                bits: encoder.generate(&line_as_str_lossy(line)),
+                source: SourceRef {
+                    line_number,
+                    byte_offset: line_start,
+                    byte_len: line.len(),
+                },
+            });
+        }
     }
 
     chunks
@@ -1276,8 +1390,64 @@ pub fn write_benchmark<W: Write>(writer: &mut W, stats: &ScanStats) -> io::Resul
 struct VectorIndex {
     file_size: u64,
     last_modified: u128,
-    vectors: Vec<[u64; VECTOR_WORDS]>,
-    sources: Vec<SourceRef>,
+    storage: VectorIndexStorage,
+}
+
+enum VectorIndexStorage {
+    Owned {
+        vectors: Vec<[u64; VECTOR_WORDS]>,
+        sources: Vec<SourceRef>,
+    },
+    Mapped {
+        mmap: Mmap,
+        entry_count: usize,
+    },
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VectorIndexEntryDisk {
+    line_number: u64,
+    byte_offset: u64,
+    byte_len: u64,
+    bits: [u64; VECTOR_WORDS],
+}
+
+impl VectorIndexEntryDisk {
+    #[inline]
+    fn source(self) -> SourceRef {
+        SourceRef {
+            line_number: u64::from_le(self.line_number),
+            byte_offset: u64::from_le(self.byte_offset) as usize,
+            byte_len: u64::from_le(self.byte_len) as usize,
+        }
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    #[inline]
+    fn bits(self) -> [u64; VECTOR_WORDS] {
+        self.bits.map(u64::from_le)
+    }
+}
+
+impl VectorIndex {
+    #[inline]
+    fn len(&self) -> usize {
+        match &self.storage {
+            VectorIndexStorage::Owned { vectors, .. } => vectors.len(),
+            VectorIndexStorage::Mapped { entry_count, .. } => *entry_count,
+        }
+    }
+
+    fn mapped_entries(&self) -> Option<&[VectorIndexEntryDisk]> {
+        match &self.storage {
+            VectorIndexStorage::Owned { .. } => None,
+            VectorIndexStorage::Mapped { mmap, entry_count } => {
+                let ptr = unsafe { mmap.as_ptr().add(INDEX_HEADER_BYTES).cast::<VectorIndexEntryDisk>() };
+                Some(unsafe { std::slice::from_raw_parts(ptr, *entry_count) })
+            }
+        }
+    }
 }
 
 fn index_path_for_input(path: &Path) -> PathBuf {
@@ -1305,16 +1475,18 @@ fn build_vector_index_from_bytes(
     let parts: Vec<Vec<(SourceRef, [u64; VECTOR_WORDS])>> = sources
         .par_chunks(batch_size)
         .map(|batch| {
-            let texts: Vec<&str> = batch
+            let texts: Vec<String> = batch
                 .iter()
-                .map(|source| line_as_str(line_bytes(bytes, *source)))
+                .map(|source| line_as_str_lossy(line_bytes(bytes, *source)))
                 .collect();
-            let bits_batch = encoder.batch_encode(&texts);
-            batch
-                .iter()
-                .copied()
-                .zip(bits_batch.into_iter())
-                .collect::<Vec<(SourceRef, [u64; VECTOR_WORDS])>>()
+            let bits_batch = encoder.batch_encode_owned(texts);
+            let mut encoded = Vec::with_capacity(batch.len());
+            for (source, maybe_bits) in batch.iter().copied().zip(bits_batch.into_iter()) {
+                if let Some(bits) = maybe_bits {
+                    encoded.push((source, bits));
+                }
+            }
+            encoded
         })
         .collect();
 
@@ -1329,30 +1501,40 @@ fn build_vector_index_from_bytes(
     Ok(VectorIndex {
         file_size: bytes.len() as u64,
         last_modified: 0,
-        vectors,
-        sources,
+        storage: VectorIndexStorage::Owned { vectors, sources },
     })
 }
 
 fn save_vector_index(path: &Path, index: &VectorIndex) -> io::Result<()> {
     let index_path = index_path_for_input(path);
-    let mut writer = BufWriter::new(File::create(index_path)?);
+    let tmp_path = PathBuf::from(format!("{}.tmp", index_path.display()));
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
 
     writer.write_all(INDEX_MAGIC)?;
     writer.write_all(&index.file_size.to_le_bytes())?;
     writer.write_all(&index.last_modified.to_le_bytes())?;
-    writer.write_all(&(index.sources.len() as u64).to_le_bytes())?;
+    writer.write_all(&(index.len() as u64).to_le_bytes())?;
 
-    for (source, bits) in index.sources.iter().zip(index.vectors.iter()) {
-        writer.write_all(&source.line_number.to_le_bytes())?;
-        writer.write_all(&(source.byte_offset as u64).to_le_bytes())?;
-        writer.write_all(&(source.byte_len as u64).to_le_bytes())?;
-        for lane in bits {
-            writer.write_all(&lane.to_le_bytes())?;
+    match &index.storage {
+        VectorIndexStorage::Owned { vectors, sources } => {
+            for (source, bits) in sources.iter().zip(vectors.iter()) {
+                writer.write_all(&source.line_number.to_le_bytes())?;
+                writer.write_all(&(source.byte_offset as u64).to_le_bytes())?;
+                writer.write_all(&(source.byte_len as u64).to_le_bytes())?;
+                for lane in bits {
+                    writer.write_all(&lane.to_le_bytes())?;
+                }
+            }
+        }
+        VectorIndexStorage::Mapped { mmap, .. } => {
+            writer.write_all(&mmap[INDEX_HEADER_BYTES..])?;
         }
     }
 
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    std::fs::rename(&tmp_path, &index_path)?;
     Ok(())
 }
 
@@ -1364,46 +1546,61 @@ fn load_vector_index(path: &Path) -> io::Result<Option<VectorIndex>> {
 
     let file_size = std::fs::metadata(path)?.len();
     let last_modified = path_modified_nanos(path)?;
-    let mut reader = BufReader::new(File::open(&index_path)?);
-
-    let mut magic = [0_u8; 8];
-    if reader.read_exact(&mut magic).is_err() || &magic != INDEX_MAGIC {
+    let index_len = std::fs::metadata(&index_path)?.len() as usize;
+    if index_len < INDEX_HEADER_BYTES {
+        let _ = std::fs::remove_file(&index_path);
         return Ok(None);
     }
 
-    let indexed_size = read_u64(&mut reader)?;
-    let indexed_last_modified = read_u128(&mut reader)?;
+    let mut header = [0_u8; INDEX_HEADER_BYTES];
+    let mut reader = File::open(&index_path)?;
+    if reader.read_exact(&mut header).is_err() {
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+    if &header[..INDEX_MAGIC.len()] != INDEX_MAGIC {
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    let entry_count = u64::from_le_bytes(header[32..40].try_into().unwrap()) as usize;
+    let entry_bytes = size_of::<VectorIndexEntryDisk>();
+    let expected_len = INDEX_HEADER_BYTES
+        .checked_add(entry_count.checked_mul(entry_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector index entry count overflow")
+        })?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "vector index length overflow"))?;
+
+    // Reject truncated or partially written index files before memory mapping.
+    if index_len != expected_len {
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
+    }
+
+    let mmap = map_file_read_only(&index_path)?;
+    let bytes = mmap.as_ref();
+    if bytes.len() != expected_len || &bytes[..INDEX_MAGIC.len()] != INDEX_MAGIC {
+        return Ok(None);
+    }
+
+    let indexed_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let indexed_last_modified = u128::from_le_bytes(bytes[16..32].try_into().unwrap());
     if indexed_size != file_size || indexed_last_modified != last_modified {
         let _ = std::fs::remove_file(&index_path);
         return Ok(None);
     }
 
-    let count = read_u64(&mut reader)? as usize;
-    let mut sources = Vec::with_capacity(count);
-    let mut vectors = Vec::with_capacity(count);
-    for _ in 0..count {
-        let line_number = read_u64(&mut reader)?;
-        let byte_offset = read_u64(&mut reader)? as usize;
-        let byte_len = read_u64(&mut reader)? as usize;
-
-        let mut bits = [0_u64; VECTOR_WORDS];
-        for lane in &mut bits {
-            *lane = read_u64(&mut reader)?;
-        }
-
-        sources.push(SourceRef {
-            line_number,
-            byte_offset,
-            byte_len,
-        });
-        vectors.push(bits);
+    let entry_region = &bytes[INDEX_HEADER_BYTES..];
+    let (prefix, entries, suffix) = unsafe { entry_region.align_to::<VectorIndexEntryDisk>() };
+    if !prefix.is_empty() || !suffix.is_empty() || entries.len() != entry_count {
+        let _ = std::fs::remove_file(&index_path);
+        return Ok(None);
     }
 
     Ok(Some(VectorIndex {
         file_size,
         last_modified,
-        vectors,
-        sources,
+        storage: VectorIndexStorage::Mapped { mmap, entry_count },
     }))
 }
 
@@ -1440,69 +1637,105 @@ fn scan_cached_vectors_from(
     });
 
     let search_start = Instant::now();
-    let (hits, candidate_count) = index
-        .vectors
-        .par_iter()
-        .zip(index.sources.par_iter())
-        .fold(
-            || (Vec::with_capacity(top_k), 0usize),
-            |(mut local_hits, mut local_candidates), (bits, source)| {
-                if let Some(m) = matcher.as_ref() {
-                    let line = line_bytes(bytes, *source);
-                    if !m.is_match(line) {
-                        return (local_hits, local_candidates);
+    let (hits, candidate_count) = match &index.storage {
+        VectorIndexStorage::Owned { vectors, sources } => vectors
+            .par_chunks(SEARCH_CHUNK_SIZE)
+            .zip(sources.par_chunks(SEARCH_CHUNK_SIZE))
+            .fold(
+                || (Vec::with_capacity(top_k), 0usize),
+                |(mut local_hits, mut local_candidates), (bits_chunk, sources_chunk)| {
+                    for (bits, source) in bits_chunk.iter().zip(sources_chunk.iter()) {
+                        if !source_is_in_bounds(bytes.len(), *source) {
+                            continue;
+                        }
+                        if let Some(m) = matcher.as_ref() {
+                            let line = line_bytes(bytes, *source);
+                            if !m.is_match(line) {
+                                continue;
+                            }
+                        }
+
+                        local_candidates += 1;
+                        let distance = hamming_distance(bits, &query_bits);
+                        if max_distance.is_none_or(|limit| distance <= limit) {
+                            insert_top_hit(
+                                &mut local_hits,
+                                SearchHit {
+                                    distance,
+                                    source: *source,
+                                },
+                                top_k,
+                            );
+                        }
                     }
-                }
+                    (local_hits, local_candidates)
+                },
+            )
+            .reduce(
+                || (Vec::with_capacity(top_k), 0usize),
+                |(mut left_hits, left_candidates), (right_hits, right_candidates)| {
+                    for hit in right_hits {
+                        insert_top_hit(&mut left_hits, hit, top_k);
+                    }
+                    (left_hits, left_candidates + right_candidates)
+                },
+            ),
+        VectorIndexStorage::Mapped { .. } => index
+            .mapped_entries()
+            .unwrap_or(&[])
+            .par_chunks(SEARCH_CHUNK_SIZE)
+            .fold(
+                || (Vec::with_capacity(top_k), 0usize),
+                |(mut local_hits, mut local_candidates), entries| {
+                    for entry in entries {
+                        let source = entry.source();
+                        if !source_is_in_bounds(bytes.len(), source) {
+                            continue;
+                        }
+                        if let Some(m) = matcher.as_ref() {
+                            let line = line_bytes(bytes, source);
+                            if !m.is_match(line) {
+                                continue;
+                            }
+                        }
 
-                local_candidates += 1;
-                let distance = hamming_distance(bits, &query_bits);
-                if max_distance.is_none_or(|limit| distance <= limit) {
-                    insert_top_hit(
-                        &mut local_hits,
-                        SearchHit {
-                            distance,
-                            source: *source,
-                        },
-                        top_k,
-                    );
-                }
-
-                (local_hits, local_candidates)
-            },
-        )
-        .reduce(
-            || (Vec::with_capacity(top_k), 0usize),
-            |(mut left_hits, left_candidates), (right_hits, right_candidates)| {
-                for hit in right_hits {
-                    insert_top_hit(&mut left_hits, hit, top_k);
-                }
-                (left_hits, left_candidates + right_candidates)
-            },
-        );
+                        local_candidates += 1;
+                        #[cfg(target_endian = "little")]
+                        let distance = hamming_distance(&entry.bits, &query_bits);
+                        #[cfg(not(target_endian = "little"))]
+                        let distance = {
+                            let bits = entry.bits();
+                            hamming_distance(&bits, &query_bits)
+                        };
+                        if max_distance.is_none_or(|limit| distance <= limit) {
+                            insert_top_hit(&mut local_hits, SearchHit { distance, source }, top_k);
+                        }
+                    }
+                    (local_hits, local_candidates)
+                },
+            )
+            .reduce(
+                || (Vec::with_capacity(top_k), 0usize),
+                |(mut left_hits, left_candidates), (right_hits, right_candidates)| {
+                    for hit in right_hits {
+                        insert_top_hit(&mut left_hits, hit, top_k);
+                    }
+                    (left_hits, left_candidates + right_candidates)
+                },
+            ),
+    };
 
     ScanResult {
         hits,
         stats: ScanStats {
             bytes_scanned: bytes.len(),
-            vector_count: index.vectors.len(),
+            vector_count: index.len(),
             candidate_count,
             total_latency: total_start.elapsed(),
             chunk_latency: Duration::ZERO,
             search_latency: search_start.elapsed(),
         },
     }
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut buf = [0_u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_u128<R: Read>(reader: &mut R) -> io::Result<u128> {
-    let mut buf = [0_u8; 16];
-    reader.read_exact(&mut buf)?;
-    Ok(u128::from_le_bytes(buf))
 }
 
 /// Creates a newline-delimited dummy corpus of approximately `size_gib` gibibytes.
@@ -1564,11 +1797,6 @@ fn line_bytes(bytes: &[u8], source: SourceRef) -> &[u8] {
     &bytes[start..end]
 }
 
-fn line_number_at_offset(bytes: &[u8], offset: usize) -> u64 {
-    let prefix_end = offset.min(bytes.len());
-    memchr_iter(b'\n', &bytes[..prefix_end]).count() as u64 + 1
-}
-
 fn collect_line_sources(bytes: &[u8]) -> Vec<SourceRef> {
     let line_count = memchr_iter(b'\n', bytes).count();
     let has_trailing_line = matches!(bytes.last(), Some(last) if *last != b'\n');
@@ -1579,6 +1807,10 @@ fn collect_line_sources(bytes: &[u8]) -> Vec<SourceRef> {
     for line_end in memchr_iter(b'\n', bytes) {
         line_number += 1;
         let line = trim_carriage_return(&bytes[line_start..line_end]);
+        if is_corrupted_line(line) {
+            line_start = line_end + 1;
+            continue;
+        }
         sources.push(SourceRef {
             line_number,
             byte_offset: line_start,
@@ -1590,18 +1822,67 @@ fn collect_line_sources(bytes: &[u8]) -> Vec<SourceRef> {
     if line_start < bytes.len() {
         line_number += 1;
         let line = trim_carriage_return(&bytes[line_start..]);
-        sources.push(SourceRef {
-            line_number,
-            byte_offset: line_start,
-            byte_len: line.len(),
-        });
+        if !is_corrupted_line(line) {
+            sources.push(SourceRef {
+                line_number,
+                byte_offset: line_start,
+                byte_len: line.len(),
+            });
+        }
     }
 
     sources
 }
 
-fn line_as_str(bytes: &[u8]) -> &str {
-    std::str::from_utf8(bytes).unwrap_or("")
+fn line_as_str_lossy(bytes: &[u8]) -> String {
+    let filtered = sanitize_for_embedding(bytes);
+    String::from_utf8_lossy(filtered.as_ref()).into_owned()
+}
+
+fn cheap_bypass_bits(text: &str) -> Option<[u64; VECTOR_WORDS]> {
+    if text.is_empty() {
+        return Some([0_u64; VECTOR_WORDS]);
+    }
+
+    if text.len() < CHEAP_BYPASS_MIN_LEN {
+        return Some(mock_binary_embedding(text.as_bytes()));
+    }
+
+    if !semantic_content_regex().is_match(text) {
+        return Some(mock_binary_embedding(text.as_bytes()));
+    }
+
+    None
+}
+
+fn semantic_content_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)[a-z]{3,}").expect("semantic regex must compile"))
+}
+
+fn sanitize_for_embedding(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.iter().all(|&byte| is_allowed_embedding_byte(byte)) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+
+    let filtered: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|&byte| is_allowed_embedding_byte(byte))
+        .collect();
+    std::borrow::Cow::Owned(filtered)
+}
+
+fn is_allowed_embedding_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\r' | b' '..=b'~')
+}
+
+fn is_corrupted_line(line: &[u8]) -> bool {
+    line.contains(&0)
+}
+
+fn source_is_in_bounds(bytes_len: usize, source: SourceRef) -> bool {
+    source.byte_offset <= bytes_len && source.byte_len <= bytes_len.saturating_sub(source.byte_offset)
 }
 
 fn quantize_sign_bits(embedding: &[f32]) -> [u64; VECTOR_WORDS] {
