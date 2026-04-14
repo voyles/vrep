@@ -99,6 +99,7 @@ cat semantic_test.txt | vrep-core "bad internet" --top-k 3
 
 The provided `stress.txt` is a **throughput benchmark only**.
 
+* Benchmarks referencing `stress.txt` (100M+ lines) refer to a **locally generated throughput benchmark only**.
 * The index contains **vector-placeholders** to test binary scanning speed (~18M vps).
 * It will **not** return semantically accurate results.
 * For real-world semantic accuracy, use a "Cold Pass" on a real dataset like `rockyou.txt`.
