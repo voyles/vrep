@@ -14,4 +14,10 @@ EOF
 
 # Commit the safeguard
 git add .gitignore
-git commit -m "chore: add .gitignore to protect repo from build/index artifacts"
+git commit -m "chore: add .gitignore to protect repo from build/index artifacts"stress.txt
+heavy.txt
+large.txt
+stress.txt
+stress.txt
+heavy.txt
+large.txt

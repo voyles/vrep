@@ -103,7 +103,7 @@ impl OnnxEncoder {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let model_path = model_dir.join("model.onnx");
 
-        eprintln!("DEBUG: Initializing ONNX session...");
+        // eprintln!("Initializing ONNX session...");
 
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|error| {
             io::Error::new(
@@ -125,7 +125,7 @@ impl OnnxEncoder {
         })?;
         let _ = Self::run_inference(&mut session, &input_bindings, &warmup)?;
 
-        eprintln!("DEBUG: ONNX Ready.");
+        // eprintln!("ONNX Ready.");
 
         Ok(Self {
             tokenizer,
